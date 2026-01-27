@@ -10,40 +10,57 @@ def connect_db():
         host="localhost",
         port=5432,
         database="deepface",
-        user="postgres2",
+        user="postgres",
         password="password"
     )
     
     cursor = conn.cursor()
     return cursor , conn
 
-def reset_table(cursor):
+def reset_table(cursor,conn):
     cursor.execute("drop table if exists embeddings")
-    cursor.execute("create table embeddings (name varchar, embedding decimal[])")
+    cursor.execute("create table embeddings (name varchar, embedding numeric[])")
 
 def insert_images_from_file(cursor,conn,path):
     representations = []
+    print(f"Scanning directory: {path}")
     for dirpath, dirnames, filenames in os.walk(path):
+        print(f"Found {len(filenames)} files in {dirpath}: {filenames}")
         for filename in filenames:
-            img_path = f"{dirpath}{filename}"
-            if ".jpg" in img_path:
-                obj = DeepFace.represent(
-                    img_path=img_path, 
-                    model_name="Facenet", 
-                    detector_backend="mtcnn",
-                )
-                embedding = obj[0]["embedding"]
-                representations.append((img_path, embedding))
+            img_path = os.path.join(dirpath, filename)
+            print(f"Checking: {img_path}")
+            if ".jpg" in img_path.lower() or ".jpeg" in img_path.lower() or ".png" in img_path.lower():
+                try:
+                    print(f"Processing: {img_path}")
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        print(f"Failed to read image: {img_path}")
+                        continue
+                    
+                    faces_data = DeepFace.extract_faces(img, detector_backend="mtcnn")
+                    
+                    if not faces_data:
+                        print(f"No faces found in {img_path}")
+                        continue
+                    
+                    face_img = faces_data[0]["face"]
+                    obj = DeepFace.represent(
+                        img_path=face_img,
+                        model_name="Facenet512",
+                        detector_backend="skip"  
+                    )
+                    embedding = obj[0]["embedding"]
+                    representations.append((img_path, embedding))
+                    print(f"Processed: {img_path}")
+                except Exception as e:
+                    print(f"Error processing {img_path}: {e}")
 
+    print(f"Total images to insert: {len(representations)}")
     for img_path, embedding in representations:
-        statement = f"""
-        insert into 
-        embeddings 
-        (name, embedding) 
-        values 
-        ("{img_path}", ARRAY{embedding});
-        """
-        cursor.execute(statement)
+        cursor.execute(
+            "INSERT INTO embeddings (name, embedding) VALUES (%s, %s)",
+            (img_path.split("\\")[-1].split("/")[-1], embedding)
+        )
     conn.commit()
 
 
@@ -53,15 +70,15 @@ def get_representation(img):
  
     target = DeepFace.represent(
         img_path=img,
-        #model_name="Facenet",
-        detector_backend="mtcnn"
+        model_name="Facenet512",
+        detector_backend="skip"
     )[0]["embedding"]
     return target
 
 
 def search_similar_faces(cursor,conn,target):
     
-    threshold = 10
+    threshold = 20
     query = f"""
         select name, distance
         from (
@@ -78,17 +95,24 @@ def search_similar_faces(cursor,conn,target):
 
     cursor.execute(query)
     rows = cursor.fetchall()
+    print(len(rows))
     
-    for img_path, distance in rows:
-        print(img_path, distance)
-        img = cv2.imread(img_path)
-        
-        fig = plt.figure(figsize = (7, 7))
-        
-        fig.add_subplot(1, 2, 1)
-        plt.imshow(img[:,:,::-1])
-        
-        fig.add_subplot(1, 2, 2)
-        plt.imshow(img[:,:,::-1])
-        
-        plt.show()
+    if len(rows)==0:
+        return {
+            "name": None,
+            "avg_distance": None,
+            "matched": False
+        }
+    
+    img_path, distance = rows[0]
+    name = img_path.split("_")
+    if len(name) > 1:
+        name = "_".join(name[:-1])
+    else:
+        name = img_path
+    
+    return {
+        "name": name,
+        "avg_distance": float(distance),
+        "matched": True
+    }
