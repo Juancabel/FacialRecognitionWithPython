@@ -2,15 +2,12 @@ import threading
 import cv2
 from deepface import DeepFace
 import os
-import time
 from enum import Enum
 import postgres_connection as pc
 
-#THINGS TO KEEP WORKIN ON: 
-
-#ADD CHECKS ON ACTUAL CAPTURE, FOR NOW 20 EMBEDDINGS IS FINE 
-#MULTIPLE FACES IN FRAME, FOR NOW ONLY FIRST FACE IS PROCESSED, CAN ADD MORE LATER
-#ADD OPTION TO DELETE INDIVIDUAL FACES, FOR NOW ONLY FULL DATABASE CLEAN, CAN ADD LATER
+#THINGS TO KEEP WORKING ON: 
+#MULTIPLE FACES IN FRAME - FOR NOW ONLY FACE CLOSEST TO CENTER IS PROCESSED
+#ADD OPTION TO DELETE INDIVIDUAL FACES - FOR NOW ONLY FULL DATABASE CLEAN
 
 
 # ============================================================================
@@ -21,8 +18,8 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 FACE_RECOGNITION_INTERVAL = 30  # Process face recognition every N frames
 EMOTION_RECOGNITION_INTERVAL = 60  # Process emotion recognition every N frames
-ADD_FACE_CAPTURE_INTERVAL = 15  # Capture embedding every N frames during add face
-ADD_FACE_DURATION_FRAMES = 300  # Total frames for add face capture (~20 captures)
+ADD_FACE_CAPTURE_INTERVAL = 30 # Capture embedding every N frames during add face
+ADD_FACE_MAX_CAPTURES = 10  # Number of embeddings to save for a new face
 
 # Colors (BGR format)
 COLOR_BLACK = (0, 0, 0)
@@ -109,6 +106,46 @@ def get_closest_result(x, y, w, h, results_dict, threshold=50):
     return closest
 
 
+def get_face_closest_to_center(faces_data, frame_width=FRAME_WIDTH, frame_height=FRAME_HEIGHT):
+    """
+    Get the face that is closest to the center of the frame.
+    
+    This ensures we always process the most prominent/centered face
+    when multiple faces are detected.
+    
+    Args:
+        faces_data: List of detected faces from DeepFace
+        frame_width: Width of the frame
+        frame_height: Height of the frame
+    
+    Returns:
+        The face_data dict for the face closest to center, or None if no faces
+    """
+    if not faces_data:
+        return None
+    
+    center_x = frame_width / 2
+    center_y = frame_height / 2
+    
+    closest_face = None
+    min_distance = float('inf')
+    
+    for face_data in faces_data:
+        facial_area = face_data['facial_area']
+        # Calculate center of face bounding box
+        face_center_x = facial_area['x'] + facial_area['w'] / 2
+        face_center_y = facial_area['y'] + facial_area['h'] / 2
+        
+        # Calculate distance from face center to frame center
+        distance = ((face_center_x - center_x) ** 2 + (face_center_y - center_y) ** 2) ** 0.5
+        
+        if distance < min_distance:
+            min_distance = distance
+            closest_face = face_data
+    
+    return closest_face
+
+
 def draw_text(frame, text, position, font_scale=0.6, text_color=COLOR_BLACK):
     """
     Draw text on the frame with a nicer font.
@@ -181,30 +218,16 @@ def draw_instructions(frame, state):
             draw_text(frame, text, (10, y_offset + i * line_height), text_color=color)
     
     elif state == AppState.ADD_FACE_CAPTURE:
-        # Calculate progress based on captures
-        elapsed_frames = frame_counter - add_face_start_frame
-        progress = min(100, (elapsed_frames / ADD_FACE_DURATION_FRAMES) * 100)
-        
+        # Show capture progress based on number of captures
         instructions = [
             "=== CAPTURING FACE ===",
             f"Name: {add_face_name}",
-            f"Captures: {add_face_capture_count}",
-            f"Progress: {progress:.0f}%"
+            f"Captures: {add_face_capture_count}/{ADD_FACE_MAX_CAPTURES}",
+            "Look at the camera..."
         ]
         for i, text in enumerate(instructions):
             color = COLOR_YELLOW if i == 0 else COLOR_BLACK
             draw_text(frame, text, (10, y_offset + i * line_height), text_color=color)
-        
-        # Draw progress bar
-        bar_width = 200
-        bar_height = 20
-        bar_x = 10
-        bar_y = y_offset + len(instructions) * line_height + 10
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
-                      COLOR_WHITE, 2)
-        fill_width = int((progress / 100) * bar_width)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), 
-                      COLOR_GREEN, -1)
 
 
 def draw_face_rectangle(frame, x, y, w, h, color, label_lines=None):
@@ -267,6 +290,7 @@ def handle_face_recognition(frame, faces_data):
     
     Only launches a new recognition thread if no other is currently running.
     This prevents CPU/RAM overload from too many concurrent threads.
+    Always processes the face closest to the center of the frame.
     
     Args:
         frame: Current video frame
@@ -274,18 +298,20 @@ def handle_face_recognition(frame, faces_data):
     """
     global frame_counter, face_recognition_in_progress
     
+    # Get the face closest to center
+    center_face = get_face_closest_to_center(faces_data)
+    
     # Process recognition every N frames, but only if no thread is already running
-    if frame_counter % FACE_RECOGNITION_INTERVAL == 0 and faces_data:
+    if frame_counter % FACE_RECOGNITION_INTERVAL == 0 and center_face:
         with thread_lock:
             if face_recognition_in_progress:
                 # Skip this frame - previous recognition still in progress
                 pass
             else:
-                # Mark as in progress and launch thread for first face only
+                # Mark as in progress and launch thread for the centered face
                 face_recognition_in_progress = True
-                face_data = faces_data[0]  # Process one face at a time
-                face_roi = face_data['face']
-                facial_area = face_data['facial_area']
+                face_roi = center_face['face']
+                facial_area = center_face['facial_area']
                 face_id = f"{facial_area['x']}_{facial_area['y']}_{facial_area['w']}_{facial_area['h']}"
                 
                 # Normalize face image if needed
@@ -352,6 +378,7 @@ def handle_emotion_recognition(frame, faces_data):
     
     Only launches a new emotion thread if no other is currently running.
     This prevents CPU/RAM overload from too many concurrent threads.
+    Always processes the face closest to the center of the frame.
     
     Args:
         frame: Current video frame
@@ -359,18 +386,20 @@ def handle_emotion_recognition(frame, faces_data):
     """
     global frame_counter, emotion_recognition_in_progress
     
+    # Get the face closest to center
+    center_face = get_face_closest_to_center(faces_data)
+    
     # Process emotion recognition every N frames, but only if no thread is running
-    if frame_counter % EMOTION_RECOGNITION_INTERVAL == 0 and faces_data:
+    if frame_counter % EMOTION_RECOGNITION_INTERVAL == 0 and center_face:
         with thread_lock:
             if emotion_recognition_in_progress:
                 # Skip this frame - previous recognition still in progress
                 pass
             else:
-                # Mark as in progress and launch thread for first face only
+                # Mark as in progress and launch thread for the centered face
                 emotion_recognition_in_progress = True
-                face_data = faces_data[0]  # Process one face at a time
-                face_roi = face_data['face']
-                facial_area = face_data['facial_area']
+                face_roi = center_face['face']
+                facial_area = center_face['facial_area']
                 face_id = f"{facial_area['x']}_{facial_area['y']}_{facial_area['w']}_{facial_area['h']}"
                 
                 # Normalize face image if needed
@@ -399,22 +428,24 @@ def handle_emotion_recognition(frame, faces_data):
 # FEATURE FUNCTIONS - ADD FACE
 # ============================================================================
 
+# Track when capture completion message should be shown
+add_face_complete_frame = 0
+
 def handle_add_face_capture(frame, faces_data):
     """
     Handle face capture mode - capture and store face embeddings.
     
-    Captures embeddings every N frames during the capture period.
+    Captures embeddings every N frames until ADD_FACE_MAX_CAPTURES is reached.
+    Only captures if a face is detected (closest to center).
     
     Args:
         frame: Current video frame
         faces_data: List of detected faces from DeepFace
     """
-    global current_state, add_face_capture_count, frame_counter, add_face_start_frame
+    global current_state, add_face_capture_count, frame_counter, add_face_start_frame, add_face_complete_frame
     
-    elapsed_frames = frame_counter - add_face_start_frame
-    
-    # Check if capture period is complete
-    if elapsed_frames >= ADD_FACE_DURATION_FRAMES:
+    # Check if capture is complete (reached max captures)
+    if add_face_capture_count >= ADD_FACE_MAX_CAPTURES:
         # Show completion message
         draw_text(frame, "=== FACE CAPTURE COMPLETE ===", 
                   (FRAME_WIDTH // 2 - 150, FRAME_HEIGHT // 2),
@@ -422,17 +453,25 @@ def handle_add_face_capture(frame, faces_data):
         draw_text(frame, f"Saved {add_face_capture_count} embeddings for '{add_face_name}'",
                   (FRAME_WIDTH // 2 - 180, FRAME_HEIGHT // 2 + 40))
         
-        # Reset to idle state after showing completion
-        if elapsed_frames >= ADD_FACE_DURATION_FRAMES + 60:  # Show for 1 second
+        # Track when completion started for delay
+        if add_face_complete_frame == 0:
+            add_face_complete_frame = frame_counter
+        
+        # Reset to idle state after showing completion for 1 second (60 frames)
+        if frame_counter - add_face_complete_frame >= 60:
             current_state = AppState.IDLE
             add_face_capture_count = 0
+            add_face_complete_frame = 0
         return
     
-    # Capture embedding every N frames
-    if elapsed_frames % ADD_FACE_CAPTURE_INTERVAL == 0 and faces_data:
-        face_data = faces_data[0]  # Use first detected face
-        face_roi = face_data['face']
-        facial_area = face_data['facial_area']
+    # Get the face closest to center
+    center_face = get_face_closest_to_center(faces_data)
+    
+    elapsed_frames = frame_counter - add_face_start_frame
+    
+    # Capture embedding every N frames, but only if a face is detected
+    if elapsed_frames % ADD_FACE_CAPTURE_INTERVAL == 0 and center_face:
+        face_roi = center_face['face']
         
         # Normalize face image if needed
         if face_roi.max() <= 1.0:
@@ -441,13 +480,18 @@ def handle_add_face_capture(frame, faces_data):
         # Insert embedding into database
         if pc.insert_single_embedding(cursor, conn, add_face_name, face_roi):
             add_face_capture_count += 1
-            print(f"Captured embedding {add_face_capture_count} for {add_face_name}")
+            print(f"Captured embedding {add_face_capture_count}/{ADD_FACE_MAX_CAPTURES} for {add_face_name}")
     
-    # Draw faces with yellow rectangle during capture
+    # Draw faces - highlight the centered face being captured
     for face_data in faces_data:
         facial_area = face_data['facial_area']
         x, y, w, h = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
-        draw_face_rectangle(frame, x, y, w, h, COLOR_YELLOW, [f"Capturing: {add_face_name}"])
+        
+        # Check if this is the centered face (use 'is' for identity comparison)
+        if center_face and face_data is center_face:
+            draw_face_rectangle(frame, x, y, w, h, COLOR_YELLOW, [f"Capturing: {add_face_name}"])
+        else:
+            draw_face_rectangle(frame, x, y, w, h, COLOR_BLUE)  # Other faces in blue
 
 
 def handle_add_face_name_input(key):
