@@ -1,3 +1,4 @@
 .venv
+.venv312
 src/images
 src/__pycache__/
